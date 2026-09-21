@@ -1,10 +1,20 @@
-# Entry point: webcam -> AprilTag detection -> PID -> Double Motor.
+# Entry point: iPhone (Continuity Camera) -> AprilTag detection -> PID -> Double Motor.
 #
-# An AprilTag sits on top of the car. The car only drives forward/backward
-# (both wheels at the same speed - no steering), and a PID loop drives it
-# until the tag's horizontal (x) pixel position is centered in the webcam
-# frame - vertical (y) position doesn't matter, so the "centered" zone is
-# drawn as a vertical band spanning the full frame height.
+# Same control scheme as main.py, but the camera is now an iPhone mounted
+# sideways on the car (facing perpendicular to its driving direction),
+# streaming to this Mac over Continuity Camera, watching a stationary
+# AprilTag placed near/on this computer. As the car drives forward/backward,
+# the moving camera sweeps past the stationary tag - the same kind of
+# horizontal parallax shift as the original setup's stationary-camera/
+# moving-tag arrangement, just with the roles swapped. So the tag's
+# horizontal (x) pixel position is still the control signal; vertical (y)
+# position still doesn't matter.
+#
+# Continuity Camera adds two things main.py didn't need to handle:
+#   - The right camera device index isn't fixed - run list_cameras.py to
+#     find it, then set CAMERA_INDEX below.
+#   - It streams over Wi-Fi, so occasional dropped frames are expected;
+#     brief read failures stop the motors and retry rather than crashing.
 
 import time
 from collections import deque
@@ -16,6 +26,14 @@ import numpy as np
 import celebration
 from apriltag_detector import AprilTagDetector
 from pid import PID
+
+# --- Camera device index for the iPhone via Continuity Camera - run
+# list_cameras.py to find the right value for your machine. ---
+CAMERA_INDEX = 2
+
+# If the camera read fails this many times in a row (e.g. a Wi-Fi hiccup),
+# stop trying and exit rather than looping forever with no video.
+MAX_READ_FAILURES = 30
 
 # --- LEGO connection card - update to match your Double Motor's card ---
 CARD_COLOR = le.LEGO_COLOR_PURPLE
@@ -29,16 +47,16 @@ KD = 0.04
 # Conservative output cap while tuning, independent of KP - this is the
 # actual ceiling on how fast the car can ever go, regardless of how far off
 # center the tag is.
-MAX_SPEED = 30.0
+MAX_SPEED = 25.0
 
 # Pixel error inside this band counts as "centered" - stops the motors
 # instead of jittering around the setpoint.
 DEADBAND_PX = 15.0
 
 # EMA smoothing on the tag's detected horizontal position (0-1: higher =
-# less smoothing, more responsive; lower = smoother, laggier). Removes the
-# frame-to-frame pixel jitter that would otherwise show up directly as
-# jerky speed changes.
+# less smoothing, more responsive; lower = smoother, laggier). Removes
+# frame-to-frame pixel jitter - and Continuity Camera's added latency makes
+# this arguably even more useful here than in main.py.
 SMOOTHING_ALPHA = 0.3
 
 # Max speed change allowed per second - ramps the commanded speed smoothly
@@ -46,9 +64,10 @@ SMOOTHING_ALPHA = 0.3
 # transition into/out of the deadband stop.
 MAX_ACCEL = 80.0
 
-# Flip to True if the car drives away from center instead of toward it -
-# means the physical mounting has the tag/camera oriented opposite to what
-# this script assumes.
+# The camera moving past a stationary tag can shift the apparent parallax
+# direction relative to the original stationary-camera setup - re-test this
+# rather than assuming main.py's tuned value carries over. Flip to True if
+# the car drives away from center instead of toward it.
 INVERT_DIRECTION = True
 
 # If no tag is seen for this many consecutive frames, stop the motors.
@@ -69,7 +88,7 @@ ENABLE_COMPLETION_STOP = False
 # back to True to restore it.
 ENABLE_CELEBRATION = False
 
-WINDOW_NAME = 'AprilTag Centering'
+WINDOW_NAME = 'AprilTag Centering (iPhone)'
 
 # How many past frames the live PID-term graph shows at once.
 GRAPH_HISTORY_FRAMES = 150
@@ -92,8 +111,8 @@ KD_SLIDER_MAX = 100
 
 def _status_label(detection, missed_frames):
 	"""Human-readable detection state for the HUD: tag found, coasting
-	through a brief dropout (see main.py's missed-detection handling), or
-	given up and stopped."""
+	through a brief dropout (see main_iphone.py's missed-detection handling),
+	or given up and stopped."""
 	if detection is not None:
 		return 'TAG DETECTED'
 	if missed_frames < MAX_MISSED_FRAMES:
@@ -167,7 +186,7 @@ def main():
 	cv2.createTrackbar('KI x100', WINDOW_NAME, int(KI * SLIDER_SCALE), KI_SLIDER_MAX, lambda _: None)
 	cv2.createTrackbar('KD x100', WINDOW_NAME, int(KD * SLIDER_SCALE), KD_SLIDER_MAX, lambda _: None)
 
-	cap = cv2.VideoCapture(0)
+	cap = cv2.VideoCapture(CAMERA_INDEX)
 	last_time = time.time()
 	missed_frames = 0
 	smoothed_cx = None
@@ -176,6 +195,7 @@ def main():
 	p_term = 0.0
 	i_term = 0.0
 	d_term = 0.0
+	consecutive_read_failures = 0
 	centered_frames = 0
 	p_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
 	i_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
@@ -185,8 +205,18 @@ def main():
 		print("Centering AprilTag horizontally in frame. Press 'q' to quit.")
 		while cap.isOpened():
 			ok, frame = cap.read()
+
 			if not ok:
-				break
+				consecutive_read_failures += 1
+				print(f'Camera read failed ({consecutive_read_failures}/{MAX_READ_FAILURES}) - stopping motors.')
+				doublemotor.movement_stop()
+				current_speed = 0.0
+				if consecutive_read_failures >= MAX_READ_FAILURES:
+					print('Too many consecutive camera read failures - exiting.')
+					break
+				continue
+
+			consecutive_read_failures = 0
 
 			pid.kp = cv2.getTrackbarPos('KP x100', WINDOW_NAME) / SLIDER_SCALE
 			pid.ki = cv2.getTrackbarPos('KI x100', WINDOW_NAME) / SLIDER_SCALE
@@ -212,8 +242,8 @@ def main():
 					smoothed_cx = None
 				# else: keep coasting at the last commanded target_speed (and
 				# last P/I/D contributions) - a brief dropout (e.g. motion
-				# blur while moving) shouldn't yank the car to a stop; only a
-				# sustained loss should.
+				# blur or a Wi-Fi hiccup) shouldn't yank the car to a stop;
+				# only a sustained loss should.
 			else:
 				missed_frames = 0
 				smoothed_cx = detection.cx if smoothed_cx is None else (
