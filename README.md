@@ -107,3 +107,25 @@ Setup specific to this variant:
   frames. A failed frame read stops the motors and retries rather than
   driving blind; `MAX_READ_FAILURES` consecutive failures exits the script
   entirely.
+
+## Celebration animation
+
+Once the tag has stayed centered for `COMPLETE_HOLD_FRAMES` consecutive
+frames (in both `main.py` and `main_iphone.py`), the run is considered
+complete: the motors stop, and `celebration.run_celebration()` plays a
+"shatter into confetti" animation using `CELEBRATION_PHOTO` (defaults to
+`ChrisRogers.png`) before the script exits.
+
+No generative image model is involved - `celebration.py` draws a party hat
+as vector shapes (positioned via a simple background-threshold heuristic,
+since OpenCV 5.x dropped the bundled Haar cascade face detector this
+project would otherwise have used), pads the canvas with matching
+background color if the source photo doesn't have enough headroom above
+the hair, then slices the resulting image into a grid of tiles that fall
+with simple gravity/velocity physics, mixed with small drawn confetti
+pieces that tumble independently.
+
+To use a different photo, swap `CELEBRATION_PHOTO` to another image path -
+works best with a similar tightly-cropped headshot on a plain, light,
+roughly-uniform background (the head-detection heuristic relies on that
+contrast).

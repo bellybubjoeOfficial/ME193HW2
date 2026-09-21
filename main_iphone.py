@@ -17,10 +17,13 @@
 #     brief read failures stop the motors and retry rather than crashing.
 
 import time
+from collections import deque
 
 import cv2
 import legoeducation as le
+import numpy as np
 
+import celebration
 from apriltag_detector import AprilTagDetector
 from pid import PID
 
@@ -37,8 +40,9 @@ CARD_COLOR = le.LEGO_COLOR_PURPLE
 CARD_SERIAL = '5164'
 
 # --- PID gains - start conservative and tune from here ---
-KP = 0.35
-KI = 0.0
+KP = 0.15
+KI = 0.09
+KD = 0.04
 
 # Conservative output cap while tuning, independent of KP - this is the
 # actual ceiling on how fast the car can ever go, regardless of how far off
@@ -69,6 +73,102 @@ INVERT_DIRECTION = True
 # If no tag is seen for this many consecutive frames, stop the motors.
 MAX_MISSED_FRAMES = 10
 
+# Once the tag has stayed centered for this many consecutive frames, the
+# run is considered complete: stop, play the celebration animation, and exit.
+CELEBRATION_PHOTO = 'ChrisRogers.png'
+COMPLETE_HOLD_FRAMES = 45
+
+# Temporarily disabled while live-tuning gains via the sliders below - the
+# run shouldn't stop/exit just because the tag centered mid-tuning. Flip
+# back to True to restore the objective-complete stop-and-exit behavior.
+ENABLE_COMPLETION_STOP = False
+
+# Temporarily disabled (see ENABLE_COMPLETION_STOP above, which already
+# skips this when off) - the photo popup interrupts each tuning run. Flip
+# back to True to restore it.
+ENABLE_CELEBRATION = False
+
+WINDOW_NAME = 'AprilTag Centering (iPhone)'
+
+# How many past frames the live PID-term graph shows at once.
+GRAPH_HISTORY_FRAMES = 150
+
+# Pixel size of the live PID-term graph, drawn in the frame's top-right corner.
+GRAPH_SIZE = (240, 110)
+
+# BGR colors for the P/I/D contribution lines on the graph.
+GRAPH_COLORS = {'P': (0, 165, 255), 'I': (0, 220, 0), 'D': (255, 0, 255)}
+
+# Live PID-gain sliders, attached to the main window: each trackbar position
+# is the gain value * SLIDER_SCALE (OpenCV trackbars are integer-only), so
+# e.g. a KP trackbar position of 40 with SLIDER_SCALE=100 means KP=0.40. The
+# *_SLIDER_MAX values are just generous tuning headroom, not hard limits.
+SLIDER_SCALE = 100.0
+KP_SLIDER_MAX = 300
+KI_SLIDER_MAX = 100
+KD_SLIDER_MAX = 100
+
+
+def _status_label(detection, missed_frames):
+	"""Human-readable detection state for the HUD: tag found, coasting
+	through a brief dropout (see main_iphone.py's missed-detection handling),
+	or given up and stopped."""
+	if detection is not None:
+		return 'TAG DETECTED'
+	if missed_frames < MAX_MISSED_FRAMES:
+		return f'GRACE ({missed_frames}/{MAX_MISSED_FRAMES})'
+	return 'NO TAG - STOPPED'
+
+
+def _draw_hud(frame, speed, error, status_label, kp, ki, kd):
+	"""Top-left text block: net speed, pixel error, detection state, and the
+	live PID gains as currently set by the sliders on this window."""
+	error_text = f'{error:+.0f}px' if error is not None else '--'
+	lines = [
+		f'Speed: {speed:+.1f} / {MAX_SPEED:.0f}',
+		f'Error: {error_text}',
+		f'Status: {status_label}',
+		f'KP={kp:.2f}  KI={ki:.2f}  KD={kd:.2f}',
+	]
+	for i, line in enumerate(lines):
+		y = 25 + i * 24
+		cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+
+def _draw_pid_graph(frame, p_history, i_history, d_history, origin):
+	"""Scrolling line graph of the last GRAPH_HISTORY_FRAMES P/I/D
+	contributions to the commanded speed (see PID.last_p/last_i/last_d),
+	each scaled to +-MAX_SPEED, drawn into a fixed box at `origin`."""
+	x0, y0 = origin
+	w, h = GRAPH_SIZE
+
+	cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (40, 40, 40), -1)
+	cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (200, 200, 200), 1)
+
+	legend_x = x0 + 4
+	for label, color in GRAPH_COLORS.items():
+		cv2.putText(frame, label, (legend_x, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+		legend_x += 18
+
+	mid_y = y0 + h // 2
+	cv2.line(frame, (x0, mid_y), (x0 + w, mid_y), (100, 100, 100), 1)
+
+	def _polyline(history):
+		if len(history) < 2:
+			return None
+		points = []
+		for i, s in enumerate(history):
+			px = x0 + int(i / (GRAPH_HISTORY_FRAMES - 1) * w)
+			norm = max(-1.0, min(1.0, s / MAX_SPEED)) if MAX_SPEED else 0.0
+			py = mid_y - int(norm * (h / 2 - 4))
+			points.append((px, py))
+		return np.array(points, dtype=np.int32)
+
+	for label, history in (('P', p_history), ('I', i_history), ('D', d_history)):
+		points = _polyline(history)
+		if points is not None:
+			cv2.polylines(frame, [points], False, GRAPH_COLORS[label], 2)
+
 
 def main():
 	doublemotor = le.DoubleMotor()
@@ -79,14 +179,27 @@ def main():
 		exit(1)
 
 	detector = AprilTagDetector()
-	pid = PID(KP, KI, output_limits=(-MAX_SPEED, MAX_SPEED))
+	pid = PID(KP, KI, KD, output_limits=(-MAX_SPEED, MAX_SPEED))
+
+	cv2.namedWindow(WINDOW_NAME)
+	cv2.createTrackbar('KP x100', WINDOW_NAME, int(KP * SLIDER_SCALE), KP_SLIDER_MAX, lambda _: None)
+	cv2.createTrackbar('KI x100', WINDOW_NAME, int(KI * SLIDER_SCALE), KI_SLIDER_MAX, lambda _: None)
+	cv2.createTrackbar('KD x100', WINDOW_NAME, int(KD * SLIDER_SCALE), KD_SLIDER_MAX, lambda _: None)
 
 	cap = cv2.VideoCapture(CAMERA_INDEX)
 	last_time = time.time()
 	missed_frames = 0
 	smoothed_cx = None
 	current_speed = 0.0
+	target_speed = 0.0
+	p_term = 0.0
+	i_term = 0.0
+	d_term = 0.0
 	consecutive_read_failures = 0
+	centered_frames = 0
+	p_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
+	i_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
+	d_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
 
 	try:
 		print("Centering AprilTag horizontally in frame. Press 'q' to quit.")
@@ -105,6 +218,10 @@ def main():
 
 			consecutive_read_failures = 0
 
+			pid.kp = cv2.getTrackbarPos('KP x100', WINDOW_NAME) / SLIDER_SCALE
+			pid.ki = cv2.getTrackbarPos('KI x100', WINDOW_NAME) / SLIDER_SCALE
+			pid.kd = cv2.getTrackbarPos('KD x100', WINDOW_NAME) / SLIDER_SCALE
+
 			h, w = frame.shape[:2]
 			target_x = w / 2.0
 
@@ -116,11 +233,17 @@ def main():
 
 			if detection is None:
 				missed_frames += 1
-				target_speed = 0.0
 				error = None
+				centered_frames = 0
 				if missed_frames >= MAX_MISSED_FRAMES:
+					target_speed = 0.0
+					p_term = i_term = d_term = 0.0
 					pid.reset()
 					smoothed_cx = None
+				# else: keep coasting at the last commanded target_speed (and
+				# last P/I/D contributions) - a brief dropout (e.g. motion
+				# blur or a Wi-Fi hiccup) shouldn't yank the car to a stop;
+				# only a sustained loss should.
 			else:
 				missed_frames = 0
 				smoothed_cx = detection.cx if smoothed_cx is None else (
@@ -130,13 +253,26 @@ def main():
 
 				if abs(error) < DEADBAND_PX:
 					target_speed = 0.0
+					p_term = i_term = d_term = 0.0
 					pid.reset()
+					centered_frames += 1
 				else:
 					output = pid.update(error, dt)
 					target_speed = -output if INVERT_DIRECTION else output
+					sign = -1.0 if INVERT_DIRECTION else 1.0
+					p_term, i_term, d_term = sign * pid.last_p, sign * pid.last_i, sign * pid.last_d
+					centered_frames = 0
 
 				cv2.polylines(frame, [detection.corners.astype(int)], True, (0, 0, 255), 5)
 				cv2.circle(frame, (int(detection.cx), int(detection.cy)), 5, (0, 0, 255), -1)
+
+			if ENABLE_COMPLETION_STOP and centered_frames >= COMPLETE_HOLD_FRAMES:
+				print('Objective complete! Tag centered.')
+				doublemotor.movement_stop()
+				if ENABLE_CELEBRATION:
+					cv2.destroyWindow(WINDOW_NAME)
+					celebration.run_celebration(CELEBRATION_PHOTO)
+				break
 
 			# Slew-rate limit: move current_speed toward target_speed by at
 			# most MAX_ACCEL * dt this frame, so speed always ramps smoothly
@@ -147,6 +283,10 @@ def main():
 			speed = current_speed
 
 			doublemotor.movement_move_tank(speed, speed, blocking=False)
+
+			p_history.append(p_term)
+			i_history.append(i_term)
+			d_history.append(d_term)
 
 			# Centered zone: a vertical band spanning the full frame height -
 			# any y position within it counts as "centered" since only
@@ -161,7 +301,10 @@ def main():
 			)
 			cv2.putText(frame, status, (10, h - 15),
 						cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-			cv2.imshow('AprilTag Centering (iPhone)', frame)
+
+			_draw_hud(frame, speed, error, _status_label(detection, missed_frames), pid.kp, pid.ki, pid.kd)
+			_draw_pid_graph(frame, p_history, i_history, d_history, origin=(w - GRAPH_SIZE[0] - 10, 10))
+			cv2.imshow(WINDOW_NAME, frame)
 
 			if cv2.waitKey(1) & 0xFF == ord('q'):
 				break
